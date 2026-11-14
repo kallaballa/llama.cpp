@@ -1697,8 +1697,39 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    //
+    // The input layer owns the token-embedding table, and the graph reads it with GET_ROWS (a
+    // gather) rather than with a matmul. Upstream keeps it on the CPU unconditionally, on the
+    // grounds that "there is very little benefit to offloading the input layer". That is true for a
+    // compute-bound matmul and false for this gather, and it is measured false on the TGL/GLES
+    // backend in this tree: with `token_embd.weight` in a host buffer type the backend *declines*
+    // GET_ROWS (29 declines per graph for a 28-layer model, one per lookup), the scheduler is then
+    // forced to split the graph, and a tensor crosses that split once per graph evaluation. Moving
+    // the table to the device removes all three: `splits` 2 -> 1, the decline census goes to zero,
+    // and pp512 measures +12.0 % with disjoint ranges against the host placement
+    // (optimization_report.md section 15.3; the same lever at llama-bench level is
+    // `-ot 'token_embd.weight=TGL'`).
+    //
+    // The condition is about the *device*, not about a build knob. A device that reports no memory
+    // of its own is host-addressable -- an integrated GPU, or a backend whose "device" buffer is
+    // host memory -- and moving the table there saves nothing, so upstream's assignment stands and
+    // this is a no-op. Otherwise the input layer gets `get_layer_buft_list(0)`, the same rule the
+    // repeating and output layers already use, which keeps `-ngl 0` and a partial offload on the
+    // CPU without a second policy to keep in step.
+    bool host_addressable_device = false;
+    for (const auto & dev : devices) {
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        ggml_backend_dev_memory(dev.dev, &free_bytes, &total_bytes);
+        // ggml_backend_dev_memory() reports 0/0 when a device has no memory of its own to report;
+        // that is the host-addressable case, not a device with no capacity.
+        if (free_bytes == 0 && total_bytes == 0) {
+            host_addressable_device = true;
+        }
+    }
+    pimpl->dev_input = (!devices.empty() && !host_addressable_device)
+        ? get_layer_buft_list(0)
+        : llama_model::impl::layer_dev{ cpu_dev, &pimpl->cpu_buft_list };
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
