@@ -3356,7 +3356,33 @@ struct test_cpy : public test_case {
             return 0.0;
         }
         if (type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 || type_dst == GGML_TYPE_IQ4_NL ||
-            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
+            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0 ||
+            // The ternary pair, for the same reason `test_set_rows::max_nmse_err()`
+            // carries them: both are 2-bit types whose trit is decided by
+            // `lroundf(x * (1.0f/d))`, and `1.0f/d` is not exact. When the block's
+            // maximum is exactly twice a weight -- `2*|x| == d`, which `f16` sources
+            // hit constantly because they are dyadic -- the product lands within one
+            // ulp of `0.5f` and whether it falls above or below decides a trit.
+            // Measured on TGL: the product comes out one ulp BELOW `0.5f`
+            // (0x3effffff against 0x3f000000), so `lroundf` returns 0 while
+            // round-half-away-from-zero -- what `lroundf` is specified to do --
+            // returns 1. TGL states the rule as the comparison `|x| >= d/2` instead,
+            // which is exact in itself and needs no division, so the disagreement is
+            // bounded and named here rather than papered over.
+            //
+            // This arm was MISSING until now, and the omission was invisible because
+            // it only bites on a draw that happens to produce a tie: `CPY(f16 ->
+            // tq1_0)` fell through to the 1e-6 floor and failed on roughly 1 draw in
+            // 18, while the identical phenomenon was already declared acceptable in
+            // `SET_ROWS` at ~1e-3. Measured on the failing draw (ne_src=[256,4,4,4],
+            // TGL, Mesa 26.2.6): NMSE 1.183e-4, which is 0.65 of a SINGLE trit flip
+            // over 16384 elements -- i.e. less than one step, not a structural defect.
+            //
+            // The step for a ternary type is `d = amax`, not `amax/8` as the 3-bit
+            // assumption below implies, so the estimate is widened 8x for the step
+            // and 16x for the `f16` tie frequency -- the same two corrections
+            // `test_set_rows` applies, in this test's [-150,150] value range.
+            type_dst == GGML_TYPE_TQ1_0 || type_dst == GGML_TYPE_TQ2_0) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-150,150], so it'll be
             // roughly (150*2.0 / 2^bits)^2, divided by the mean square value of the reference,
@@ -3372,7 +3398,16 @@ struct test_cpy : public test_case {
             if (type_dst == GGML_TYPE_Q8_0) {
                 err_estimate /= 8.0f;
             }
+            if (type_dst == GGML_TYPE_TQ1_0 || type_dst == GGML_TYPE_TQ2_0) {
+                // a ternary step is the block maximum, not a 3-bit fraction of it
+                err_estimate *= 8.0f;
+            }
             err_estimate *= err_estimate;
+            if (type_src == GGML_TYPE_F16 &&
+                (type_dst == GGML_TYPE_TQ1_0 || type_dst == GGML_TYPE_TQ2_0)) {
+                // dyadic sources hit the exact tie far more often
+                err_estimate *= 16.0f;
+            }
             err_estimate /= (150.0f*150.0f*0.25f)*float(total_elements());
             return err_estimate;
         }
@@ -13697,6 +13732,33 @@ int main(int argc, char ** argv) {
     }
 
     output_printer->print_testing_start(testing_start_info(ggml_backend_dev_count()));
+
+    // A `-b <name>` filter that matches no loaded device must be an ERROR, not a
+    // silent pass. Without this, `-b TGL0` with GGML_BACKEND_PATH unset enumerates
+    // only Vulkan0 and CPU, every device is "Skipping", and the run ends with
+    // `2/2 backends passed` -- a green verdict for a backend that was never loaded.
+    // That is HANDOFF s5.2e's trap, and it is the same shape as trap 11: the failure
+    // is silent and the output looks like success.
+    if (backend_filter != NULL) {
+        bool matched = false;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            if (strcmp(backend_filter, ggml_backend_dev_name(ggml_backend_dev_get(i))) == 0) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            fprintf(stderr, "\n%s: no backend device named '%s' is loaded.\n", argv[0], backend_filter);
+            fprintf(stderr, "  loaded devices:");
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                fprintf(stderr, " %s", ggml_backend_dev_name(ggml_backend_dev_get(i)));
+            }
+            fprintf(stderr, "\n  An out-of-tree backend (e.g. TGL0) is loaded through GGML_BACKEND_PATH;\n"
+                            "  without it the module is never dlopen()ed and this filter matches nothing.\n"
+                            "  Refusing to report a pass for a backend that was not tested.\n");
+            return 1;
+        }
+    }
 
     size_t n_ok = 0;
 
