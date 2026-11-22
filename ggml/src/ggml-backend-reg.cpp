@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -541,7 +542,26 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
         }
 
         if (dir_ec) {
-            GGML_LOG_DEBUG("%s: failed to enumerate %s: %s\n", __func__, path_str(search_path).c_str(), dir_ec.message().c_str());
+            // This call is per backend *name* (see the entry points at the bottom of this
+            // file), and each one rebuilds `search_paths` from scratch -- so one
+            // unreadable search path prints the same line once per name. On a
+            // deployment where GGML_BACKEND_DIR is a build-tree path that does not
+            // exist next to the binary, that produced 15 identical lines in a single
+            // V4D probe, all of them noise (the path cannot exist by construction),
+            // and a reader reasonably reported it as a defect.
+            //
+            // Deduplicate per path, and use INFO rather than DEBUG: a real
+            // enumeration failure should still be visible, not hidden behind a log
+            // level that nothing filters (GGML_PRINT_DEBUG's callback prints
+            // everything it is handed).
+            //
+            // Function-local static, so the set is per-process and thread-safe
+            // without a lock beyond the initializer.
+            static std::set<std::string> reported;
+            const std::string key = path_str(search_path);
+            if (reported.insert(key).second) {
+                GGML_LOG_INFO("%s: failed to enumerate %s: %s\n", __func__, key.c_str(), dir_ec.message().c_str());
+            }
         }
     }
 
