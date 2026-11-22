@@ -1706,29 +1706,59 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // GET_ROWS (29 declines per graph for a 28-layer model, one per lookup), the scheduler is then
     // forced to split the graph, and a tensor crosses that split once per graph evaluation. Moving
     // the table to the device removes all three: `splits` 2 -> 1, the decline census goes to zero,
-    // and pp512 measures +12.0 % with disjoint ranges against the host placement
-    // (optimization_report.md section 15.3; the same lever at llama-bench level is
-    // `-ot 'token_embd.weight=TGL'`).
+    // and pp512 measures +2.8 % with disjoint ranges against the host placement (3 interleaved
+    // process reps, Qwen3-0.6B-Q4_0, `-p 512 -n 512 -r 3 -fa off`).
     //
-    // The condition is about the *device*, not about a build knob. A device that reports no memory
-    // of its own is host-addressable -- an integrated GPU, or a backend whose "device" buffer is
-    // host memory -- and moving the table there saves nothing, so upstream's assignment stands and
-    // this is a no-op. Otherwise the input layer gets `get_layer_buft_list(0)`, the same rule the
-    // repeating and output layers already use, which keeps `-ngl 0` and a partial offload on the
-    // CPU without a second policy to keep in step.
-    bool host_addressable_device = false;
-    for (const auto & dev : devices) {
+    // The same lever at llama-bench level is `-ot 'token_embd.weight=TGL'`, which is how to
+    // reproduce it without this default.
+    //
+    // **This is deliberately gated to the backend it was measured on.** The evidence above is
+    // entirely TGL/GLES-specific: it is the *decline* of GET_ROWS that makes host placement
+    // expensive here, and that decline is a TGL behaviour. Upstream's heuristic was not an
+    // oversight, and on CUDA/ROCm/Vulkan/Metal there is no measured reason to replace it -- moving
+    // the input layer there by default would change placement for users of this pin on the
+    // strength of one backend's numbers. The test is the standard ggml device-name
+    // convention: a device is `<registry><index>` and `ggml_backend_dev_name()`
+    // returns that full name ("TGL0", "Vulkan0", "CPU"), not the bare registry.
+    // ggml-tgl's own `devName()` returns the literal "TGL0" (`src/device.cpp`), so
+    // comparing against "TGL" would never match and this whole block would be dead
+    // code -- which is the failure mode this comment exists to prevent, and one
+    // that compiles and runs cleanly while claiming a gate it does not have. An
+    // unknown backend keeps upstream's CPU assignment.
+    //
+    // The second condition is about *the device the input layer would land on*, not about the
+    // device set. A device that reports no memory of its own is host-addressable -- an integrated
+    // GPU, or a backend whose "device" buffer is host memory -- and moving the table there saves
+    // nothing, so upstream's assignment stands. Evaluating that over the union of devices is
+    // wrong on a hybrid host: one host-addressable iGPU alongside a dGPU with real VRAM would
+    // force the input layer to the CPU even though the layers it sits beside are on the dGPU,
+    // reintroducing exactly the graph split, the cross-split copy and the GET_ROWS declines this
+    // block exists to remove. So the probe runs on `get_layer_buft_list(0)`'s device -- the one
+    // the table would actually use -- and on nothing else.
+    //
+    // `get_layer_buft_list(0)` also keeps `-ngl 0` and a partial offload on the CPU without a
+    // second policy to keep in step: it short-circuits on `il < i_gpu_start`, and `-ngl 0` puts
+    // `i_gpu_start` past every layer.
+    const bool input_gather_declines_on_host =
+        std::any_of(devices.begin(), devices.end(), [](const llama_device & dev) {
+            const char * name = ggml_backend_dev_name(dev.dev);
+            return name != nullptr && std::strncmp(name, "TGL", 3) == 0;
+        });
+
+    llama_model::impl::layer_dev dev_input_candidate = get_layer_buft_list(0);
+
+    bool candidate_is_host_addressable = false;
+    if (dev_input_candidate.dev != nullptr) {
         size_t free_bytes = 0;
         size_t total_bytes = 0;
-        ggml_backend_dev_memory(dev.dev, &free_bytes, &total_bytes);
+        ggml_backend_dev_memory(dev_input_candidate.dev, &free_bytes, &total_bytes);
         // ggml_backend_dev_memory() reports 0/0 when a device has no memory of its own to report;
         // that is the host-addressable case, not a device with no capacity.
-        if (free_bytes == 0 && total_bytes == 0) {
-            host_addressable_device = true;
-        }
+        candidate_is_host_addressable = (free_bytes == 0 && total_bytes == 0);
     }
-    pimpl->dev_input = (!devices.empty() && !host_addressable_device)
-        ? get_layer_buft_list(0)
+
+    pimpl->dev_input = (input_gather_declines_on_host && !candidate_is_host_addressable)
+        ? dev_input_candidate
         : llama_model::impl::layer_dev{ cpu_dev, &pimpl->cpu_buft_list };
 
     // assign the repeating layers to the devices according to the splits
